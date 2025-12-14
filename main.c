@@ -306,7 +306,7 @@ user_t *read_users_file(const char *filename, size_t *out_count) {
 
         char *sep = strstr(line, "::");
         if (!sep) {
-            fprintf(stderr, "Invalid format: %s\n", line);
+            fprintf(stderr, "Invalid format for user.\n");
             continue;
         }
 
