@@ -1,5 +1,6 @@
 #ifdef _WIN32
 #include <windows.h>
+#include <process.h>
 
 #define THREAD_RET DWORD
 #define THREAD_PARAM LPVOID
@@ -7,17 +8,23 @@
 
 typedef HANDLE thread_t;
 typedef HANDLE mutex_t;
-typedef HANDLE semaphore_t;
+typedef HANDLE sem_t;
 
-#define MUTEX_INIT(m)    ((m) = CreateMutex(NULL, FALSE, NULL))
-#define MUTEX_LOCK(m)    WaitForSingleObject((m), INFINITE)
-#define MUTEX_UNLOCK(m)  ReleaseMutex((m))
-#define MUTEX_DESTROY(m) CloseHandle((m))
+#define MUTEX_INIT(m)   m = CreateMutex(NULL, FALSE, NULL)
+#define MUTEX_LOCK(m)   WaitForSingleObject(m, INFINITE)
+#define MUTEX_UNLOCK(m) ReleaseMutex(m)
+#define MUTEX_DESTROY(m) CloseHandle(m)
 
-#define SEM_INIT(s, v)   ((s) = CreateSemaphore(NULL, (v), LONG_MAX, NULL))
-#define SEM_WAIT(s)      WaitForSingleObject((s), INFINITE)
-#define SEM_POST(s)      ReleaseSemaphore((s), 1, NULL)
-#define SEM_DESTROY(s)   CloseHandle((s))
+#define SEM_INIT(s, v)  s = CreateSemaphore(NULL, v, LONG_MAX, NULL)
+#define SEM_WAIT(s)     WaitForSingleObject(s, INFINITE)
+#define SEM_POST(s)     ReleaseSemaphore(s, 1, NULL)
+#define SEM_DESTROY(s)  CloseHandle(s)
+
+#define THREAD_CREATE(t, func, arg) \
+    do { *(t) = CreateThread(NULL, 0, (LPTHREAD_START_ROUTINE)func, arg, 0, NULL); } while(0)
+
+#define THREAD_JOIN(t) \
+    do { WaitForSingleObject(t, INFINITE); CloseHandle(t); } while(0)
 
 #else
 #include <pthread.h>
@@ -30,17 +37,21 @@ typedef HANDLE semaphore_t;
 
 typedef pthread_t thread_t;
 typedef pthread_mutex_t mutex_t;
-typedef sem_t semaphore_t;
+typedef sem_t sem_t;
 
-#define MUTEX_INIT(m)    pthread_mutex_init(&(m), NULL)
-#define MUTEX_LOCK(m)    pthread_mutex_lock(&(m))
-#define MUTEX_UNLOCK(m)  pthread_mutex_unlock(&(m))
+#define MUTEX_INIT(m)   pthread_mutex_init(&(m), NULL)
+#define MUTEX_LOCK(m)   pthread_mutex_lock(&(m))
+#define MUTEX_UNLOCK(m) pthread_mutex_unlock(&(m))
 #define MUTEX_DESTROY(m) pthread_mutex_destroy(&(m))
 
-#define SEM_INIT(s, v)   sem_init(&(s), 0, (v))
-#define SEM_WAIT(s)      sem_wait(&(s))
-#define SEM_POST(s)      sem_post(&(s))
-#define SEM_DESTROY(s)   sem_destroy(&(s))
+#define SEM_INIT(s, v)  sem_init(&(s), 0, v)
+#define SEM_WAIT(s)     sem_wait(&(s))
+#define SEM_POST(s)     sem_post(&(s))
+#define SEM_DESTROY(s)  sem_destroy(&(s))
+
+#define THREAD_CREATE(t, func, arg) pthread_create(t, NULL, func, arg)
+#define THREAD_JOIN(t)  pthread_join(t, NULL)
+
 #endif
 
 #include <stdio.h>
@@ -50,13 +61,35 @@ typedef sem_t semaphore_t;
 #include <limits.h>
 #include <errno.h>
 
-
 #define MAX_THREADS 6
 #define MIN_THREADS 1
 #define PASS_LEN 4
 #define CHARSET_LEN 52
 
 char *INPUT_FILE = "users.txt";
+
+#ifdef _WIN32
+ssize_t getline(char **lineptr, size_t *n, FILE *stream) {
+    if (!lineptr || !n || !stream) return -1;
+    if (!*lineptr) { *n = 128; *lineptr = malloc(*n); if (!*lineptr) return -1; }
+    size_t pos = 0;
+    int c;
+    while ((c = fgetc(stream)) != EOF) {
+        if (pos + 1 >= *n) {
+            size_t new_n = *n * 2;
+            char *new_ptr = realloc(*lineptr, new_n);
+            if (!new_ptr) return -1;
+            *lineptr = new_ptr;
+            *n = new_n;
+        }
+        (*lineptr)[pos++] = c;
+        if (c == '\n') break;
+    }
+    if (pos == 0) return -1;
+    (*lineptr)[pos] = '\0';
+    return pos;
+}
+#endif
 
 /* MD5 constants */
 static const uint32_t r[] = {
@@ -89,7 +122,7 @@ static const char charset[] =
     "abcdefghijklmnopqrstuvwxyz"
     "ABCDEFGHIJKLMNOPQRSTUVWXYZ";
 
-pthread_mutex_t file_mutex = PTHREAD_MUTEX_INITIALIZER;
+mutex_t file_mutex;
 sem_t *sems;
 
 typedef struct {
@@ -114,11 +147,13 @@ void free_users(user_t *users, size_t count);
 void md5(const uint8_t *initial_msg, size_t initial_len, uint8_t digest[16]);
 static uint32_t left_rotate(uint32_t x, uint32_t c);
 void md5_hex(const char *input, char output[33]);
-int crack_md5_len4(const char *target_hash, char result[4]);
+int crack_md5_len4(const char *target_hash, char result[5]);
 
-void *crack_user_thread(void *arg);
+THREAD_RET WINAPI_ATTR crack_user_thread(THREAD_PARAM arg);
 
 int main(const int argc, char *argv[]) {
+    MUTEX_INIT(file_mutex);
+
     if (argc != 3) {
         fprintf(stderr, "Usage: %s <output_file> <threads>\n", argv[0]);
         return -1;
@@ -155,20 +190,26 @@ int main(const int argc, char *argv[]) {
     }
 
     FILE *out = fopen(output_file, "w");
+    if (!out) {
+        perror("fopen output");
+        free_users(users, user_count);
+        return -1;
+    }
 
     char (*results)[PASS_LEN + 1] = malloc(sizeof(*results) * user_count);
     if (!results) {
         perror("malloc results");
         free_users(users, user_count);
+        fclose(out);
         return -1;
     }
 
-    pthread_t threads[user_count];
+    thread_t threads[user_count];
     thread_arg_t args[user_count];
 
     sems = malloc(sizeof(sem_t) * user_count);
     for (size_t i = 0; i < user_count; i++) {
-        sem_init(&sems[i], 0, 0);
+        SEM_INIT(sems[i], 0);
     }
 
     for (size_t i = 0; i < user_count; i++) {
@@ -179,18 +220,19 @@ int main(const int argc, char *argv[]) {
             .output = out,
             .sems = sems
         };
-        pthread_create(&threads[i], NULL, crack_user_thread, &args[i]);
+        THREAD_CREATE(&threads[i], crack_user_thread, &args[i]);
     }
 
-    sem_post(&sems[0]);
+    SEM_POST(sems[0]);
 
     for (size_t i = 0; i < user_count; i++)
-        pthread_join(threads[i], NULL);
+        THREAD_JOIN(threads[i]);
 
     for (size_t i = 0; i < user_count; i++)
-        sem_destroy(&sems[i]);
+        SEM_DESTROY(sems[i]);
     free(sems);
 
+    MUTEX_DESTROY(file_mutex);
     fclose(out);
 
     free_users(users, user_count);
@@ -297,6 +339,8 @@ user_t *read_users_file(const char *filename, size_t *out_count) {
     }
 
     *out_count = count;
+    free(line);
+    fclose(file);
     return users;
 
     cleanup:
@@ -439,9 +483,8 @@ int crack_md5_len4(const char *target_hash, char result[5]) {
     return 0;
 }
 
-
-void *crack_user_thread(void *arg) {
-    thread_arg_t *t = arg;
+THREAD_RET WINAPI_ATTR crack_user_thread(THREAD_PARAM arg) {
+    thread_arg_t *t = (thread_arg_t *)arg;
 
     char password[PASS_LEN + 1];
     printf("Cracking user: %s...\n", t->user->username);
@@ -453,11 +496,13 @@ void *crack_user_thread(void *arg) {
     strcpy(t->results[t->index], password);
 
     if (t->index > 0)
-        sem_wait(&t->sems[t->index - 1]);
+        SEM_WAIT(t->sems[t->index - 1]);
 
+    MUTEX_LOCK(file_mutex);
     fprintf(t->output, "%s %s\n", t->user->username, t->results[t->index]);
+    MUTEX_UNLOCK(file_mutex);
 
-    sem_post(&t->sems[t->index]);
+    SEM_POST(t->sems[t->index]);
 
-    return NULL;
+    return 0;
 }
