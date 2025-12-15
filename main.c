@@ -511,7 +511,7 @@ THREAD_RET WINAPI_ATTR crack_user_thread(THREAD_PARAM arg) {
         if (i > 0)
             SEM_WAIT(p->sems[i - 1]);
 
-        fprintf(p->output, "%s %s\n",
+        fprintf(p->output, "%s\t%s\n",
                 p->users[i].username,
                 p->results[i]);
 
