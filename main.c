@@ -122,21 +122,21 @@ static const char charset[] =
     "abcdefghijklmnopqrstuvwxyz"
     "ABCDEFGHIJKLMNOPQRSTUVWXYZ";
 
-mutex_t file_mutex;
-sem_t *sems;
-
 typedef struct {
     char *username;
     char *hash;
 } user_t;
 
 typedef struct {
-    user_t *user;
-    size_t index;
+    user_t *users;
+    size_t user_count;
+    size_t *next_index;
+    mutex_t index_mutex;
     char (*results)[PASS_LEN + 1];
     FILE *output;
     sem_t *sems;
-} thread_arg_t;
+} pool_arg_t;
+
 
 int parse_int_arg(int argc, char *argv[], int position, int *out_value);
 int parse_string_arg(int argc, char *argv[], int position, const char **out_str);
@@ -152,8 +152,6 @@ int crack_md5_len4(const char *target_hash, char result[5]);
 THREAD_RET WINAPI_ATTR crack_user_thread(THREAD_PARAM arg);
 
 int main(const int argc, char *argv[]) {
-    MUTEX_INIT(file_mutex);
-
     if (argc != 3) {
         fprintf(stderr, "Usage: %s <output_file> <threads>\n", argv[0]);
         return -1;
@@ -169,22 +167,19 @@ int main(const int argc, char *argv[]) {
         return -1;
 
     if (threads_qty < MIN_THREADS || threads_qty > MAX_THREADS) {
-        fprintf(stderr, "Threads quantity must be over 0 and under 7.\n");
+        fprintf(stderr, "Threads quantity must be between %d and %d\n", MIN_THREADS, MAX_THREADS);
         return -1;
     }
 
-    fprintf(stdout, "Output file: %s\n", output_file);
-    fprintf(stdout, "Running %d threads\n", threads_qty);
+    printf("Output file: %s\n", output_file);
+    printf("Running %d threads\n", threads_qty);
 
     size_t user_count;
     user_t *users = read_users_file("users.txt", &user_count);
-
-    if (!users) {
-        return -1;
-    }
+    if (!users) return -1;
 
     if (user_count > 50) {
-        fprintf(stderr, "Error: user_count exceeds maximum allowed (50)\n");
+        fprintf(stderr, "Error: maximum 50 users allowed\n");
         free_users(users, user_count);
         return -1;
     }
@@ -196,47 +191,54 @@ int main(const int argc, char *argv[]) {
         return -1;
     }
 
-    char (*results)[PASS_LEN + 1] = malloc(sizeof(*results) * user_count);
+    char (*results)[PASS_LEN + 1] = malloc(user_count * sizeof(*results));
     if (!results) {
         perror("malloc results");
-        free_users(users, user_count);
         fclose(out);
+        free_users(users, user_count);
         return -1;
     }
 
-    thread_t threads[user_count];
-    thread_arg_t args[user_count];
+    sem_t *sems = malloc(user_count * sizeof(sem_t));
+    if (!sems) {
+        perror("malloc sems");
+        free(results);
+        fclose(out);
+        free_users(users, user_count);
+        return -1;
+    }
 
-    sems = malloc(sizeof(sem_t) * user_count);
-    for (size_t i = 0; i < user_count; i++) {
+    for (size_t i = 0; i < user_count; i++)
         SEM_INIT(sems[i], 0);
-    }
 
-    for (size_t i = 0; i < user_count; i++) {
-        args[i] = (thread_arg_t){
-            .user = &users[i],
-            .index = i,
-            .results = results,
-            .output = out,
-            .sems = sems
-        };
-        THREAD_CREATE(&threads[i], crack_user_thread, &args[i]);
-    }
+    size_t next_index = 0;
+    pool_arg_t pool = {
+        .users = users,
+        .user_count = user_count,
+        .next_index = &next_index,
+        .results = results,
+        .output = out,
+        .sems = sems
+    };
+    MUTEX_INIT(pool.index_mutex);
+
+    thread_t threads[threads_qty];
+    for (int i = 0; i < threads_qty; i++)
+        THREAD_CREATE(&threads[i], crack_user_thread, &pool);
 
     SEM_POST(sems[0]);
 
-    for (size_t i = 0; i < user_count; i++)
+    for (int i = 0; i < threads_qty; i++)
         THREAD_JOIN(threads[i]);
 
+    MUTEX_DESTROY(pool.index_mutex);
     for (size_t i = 0; i < user_count; i++)
         SEM_DESTROY(sems[i]);
+
     free(sems);
-
-    MUTEX_DESTROY(file_mutex);
-    fclose(out);
-
-    free_users(users, user_count);
     free(results);
+    fclose(out);
+    free_users(users, user_count);
 
     return 0;
 }
@@ -484,25 +486,37 @@ int crack_md5_len4(const char *target_hash, char result[5]) {
 }
 
 THREAD_RET WINAPI_ATTR crack_user_thread(THREAD_PARAM arg) {
-    thread_arg_t *t = (thread_arg_t *)arg;
+    pool_arg_t *p = arg;
 
-    char password[PASS_LEN + 1];
-    printf("Cracking user: %s...\n", t->user->username);
+    while (1) {
+        MUTEX_LOCK(p->index_mutex);
+        if (*p->next_index >= p->user_count) {
+            MUTEX_UNLOCK(p->index_mutex);
+            break;
+        }
+        size_t i = (*p->next_index)++;
+        MUTEX_UNLOCK(p->index_mutex);
 
-    if (!crack_md5_len4(t->user->hash, password)) {
-        strcpy(password, "NULL");
+        char password[PASS_LEN + 1];
+        printf("Cracking user: %s...\n", p->users[i].username);
+
+        if (!crack_md5_len4(p->users[i].hash, password)) {
+            SEM_WAIT(p->sems[i - 1]);
+            SEM_POST(p->sems[i]);
+            continue;
+        }
+
+        strcpy(p->results[i], password);
+
+        if (i > 0)
+            SEM_WAIT(p->sems[i - 1]);
+
+        fprintf(p->output, "%s %s\n",
+                p->users[i].username,
+                p->results[i]);
+
+        SEM_POST(p->sems[i]);
     }
-
-    strcpy(t->results[t->index], password);
-
-    if (t->index > 0)
-        SEM_WAIT(t->sems[t->index - 1]);
-
-    MUTEX_LOCK(file_mutex);
-    fprintf(t->output, "%s %s\n", t->user->username, t->results[t->index]);
-    MUTEX_UNLOCK(file_mutex);
-
-    SEM_POST(t->sems[t->index]);
 
     return 0;
 }

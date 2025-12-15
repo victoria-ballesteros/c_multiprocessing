@@ -1,5 +1,5 @@
-miguel aaa
-zerocool hAcK
+zerocool aaa
+miguel hOLa
 maria VAkA
 juan kkkk
 lucas hOLa
@@ -18,5 +18,4 @@ maria VAkA
 juan kkkk
 lucas hOLa
 ana aHS
-pedro LINU
 sofia TOrv
